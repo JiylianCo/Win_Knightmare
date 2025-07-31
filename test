@@ -10,7 +10,7 @@ from logging.handlers import RotatingFileHandler
 from send2trash import send2trash
 from typing import Set, List
 
-# ==================== 配置部分 ====================
+# 配置部分 
 class Config:
     # 白名单
     WHITELIST_REGEX = re.compile(
