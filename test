@@ -1,123 +1,195 @@
 import os
 import sys
+import re
 import logging
 import ctypes
 import winshell
-import shutil
+import time
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from send2trash import send2trash
+from typing import Set, List
 
-# 配置日志系统
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    handlers=[
-        logging.FileHandler('cleaner.log', encoding='utf-8'),
+# ==================== 配置部分 ====================
+class Config:
+    # 白名单
+    WHITELIST_REGEX = re.compile(
+        r'(desktop\.ini|thumbs\.db|'
+        r'node_modules|\.git|\.?venv|env|'
+        r'(windows|winsxs|system32|boot|intel|amd|nvidia)[\\/]|'
+        r'system volume information|'
+        r'\$recycle\.bin|'
+        r'appdata|program files|'
+        r'perflogs|msocache)',
+        re.IGNORECASE
+    )
+    
+    # 临时文件扩展名
+    TEMP_EXTENSIONS = {'.tmp', '.temp', '.download', '.crdownload', 
+                      '.part', '.partial', '.dmp', '.log', '.bak'}
+    
+    # 最大目录深度
+    MAX_DIR_DEPTH = 20
+    
+    # 日志配置
+    LOG_FILE = 'cleaner.log'
+    LOG_MAX_SIZE = 5 * 1024 * 1024  # 5MB
+    LOG_BACKUP_COUNT = 3
+
+# 工具函数 
+def init_logging():
+    """安全日志初始化"""
+    class SensitiveFilter(logging.Filter):
+        def filter(self, record):
+            if hasattr(record, 'msg'):
+                record.msg = str(record.msg).replace(os.getenv('USERNAME', ''), '***')
+            return True
+            
+    handlers = [
+        RotatingFileHandler(
+            Config.LOG_FILE,
+            maxBytes=Config.LOG_MAX_SIZE,
+            backupCount=Config.LOG_BACKUP_COUNT,
+            encoding='utf-8'
+        ),
         logging.StreamHandler()
     ]
-)
+    
+    for handler in handlers:
+        handler.addFilter(SensitiveFilter())
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] %(levelname)s: %(message)s',
+        handlers=handlers
+    )
 
-# 增强版白名单（小写统一）
-WHITELIST = {
-    'desktop.ini', 'thumbs.db', 
-    'node_modules', '.git', '.venv', 'venv', 'env',
-    'winsxs', 'system32', 'system volume information', 
-    '$recycle.bin', 'appdata', 'program files', 'windows',
-    'boot', 'intel', 'amd', 'nvidia', 'perflogs', 'msocache'
-}
-
-def is_admin():
+def is_admin() -> bool:
     """检查是否以管理员权限运行"""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
     except:
         return False
 
-def is_resource_in_use(path):
-    """检查文件或目录是否被占用"""
-    try:
-        # 文件占用检查
-        if path.is_file():
-            with open(path, 'a', encoding='utf-8'):
-                pass
-            return False
-        
-        # 目录占用检查 - 尝试重命名测试
-        if path.is_dir():
-            test_rename = path.with_name(f"{path.name}_temp_test")
-            path.rename(test_rename)
-            test_rename.rename(path)
-            return False
-            
-        return False
-    except (OSError, PermissionError):
-        return True  # 资源被占用或权限不足
-    except Exception:
-        return False
+def require_admin():
+    """强制要求管理员权限"""
+    if not is_admin():
+        logging.error('此操作需要管理员权限')
+        if ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1) <= 32:
+            logging.error('权限提升失败')
+        sys.exit(1)
 
-def safe_delete(path: Path, preview: bool = True):
+def is_whitelisted(path: Path) -> bool:
+    """检查路径是否在白名单中"""
+    # 使用Config.WHITELIST_REGEX正则表达式来匹配路径，如果匹配成功则返回True，否则返回False
+    return bool(Config.WHITELIST_REGEX.search(str(path)))
+
+#  核心功能 
+def is_resource_in_use(path: Path) -> bool:
+    """增强版资源占用检查"""
+    try:
+        if path.is_file():
+            # 尝试获取文件独占锁
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_EXCL | os.O_NOINHERIT)
+                os.close(fd)
+                return False
+            except OSError as e:
+                return True
+                
+        elif path.is_dir():
+            # 尝试创建测试文件检查目录可写性
+            test_file = path / f".test_{os.getpid()}"
+            try:
+                test_file.touch(exist_ok=False)
+                test_file.unlink()
+                return False
+            except:
+                return True
+                
+        return False
+    except Exception:
+        logging.exception(f"资源检查异常: {path}")
+        return True  # 保守处理，视为占用
+
+def safe_delete(path: Path, preview: bool = True) -> bool:
     """
     安全删除文件或文件夹
-    :param path: 待删除路径
-    :param preview: True=仅打印，False=真正删除
+    :return: 是否执行了删除操作
     """
     try:
-        # 检查白名单（不区分大小写）
-        path_lower = str(path).lower()
-        if any(protected in path_lower for protected in WHITELIST):
+        # 检查白名单
+        if is_whitelisted(path):
             logging.info(f'[跳过] 白名单: {path}')
-            return
+            return False
             
-        # 检查资源是否被占用
+        # 检查符号链接
+        if path.is_symlink():
+            logging.warning(f'[跳过] 符号链接: {path}')
+            return False
+            
+        # 检查目录深度
+        if path.is_dir():
+            dir_depth = len(str(path.resolve()).split(os.sep))
+            if dir_depth > Config.MAX_DIR_DEPTH:
+                logging.warning(f'[跳过] 目录层级过深: {path}')
+                return False
+                
+        # 检查资源占用
         if is_resource_in_use(path):
             logging.warning(f'[跳过] 资源被占用: {path}')
-            return
+            return False
             
-        # 预览模式只记录不删除
+        # 预览模式
         if preview:
             logging.info(f'[预览] 将删除: {path}')
-            return
+            return False
             
-        # 实际删除操作
+        # 实际删除
         send2trash(path)
         logging.info(f'[删除] {"目录" if path.is_dir() else "文件"}: {path}')
+        return True
         
     except Exception as e:
         logging.error(f'[错误] 删除失败: {path} - {str(e)}')
+        return False
 
-def get_system_temp_dirs():
-    """获取系统所有可能的临时目录"""
-    temp_dirs = []
+def get_system_temp_dirs() -> List[Path]:
+    """获取所有系统临时目录（安全版）"""
+    temp_dirs = set()
     
     # 标准环境变量
     env_vars = ['TEMP', 'TMP', 'LOCALAPPDATA']
     for var in env_vars:
-        if path := os.environ.get(var):
-            temp_dirs.append(Path(path))
+        if path_str := os.environ.get(var):
+            try:
+                path = Path(path_str).resolve()
+                if path.exists() and os.access(path, os.R_OK | os.W_OK):
+                    temp_dirs.add(path)
+            except (OSError, RuntimeError):
+                continue
     
-    # 常见系统临时目录
+    # 系统目录
     system_dirs = [
+        Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'Temp',
         Path('C:/Windows/Temp'),
         Path('C:/Windows/Logs'),
         Path('C:/Windows/Prefetch'),
-        Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'Temp',
     ]
     
-    # 用户特定临时目录
-    user_profile = Path(os.environ.get('USERPROFILE', ''))
-    if user_profile.exists():
-        temp_dirs.extend([
-            user_profile / 'AppData/Local/Temp',
-            user_profile / 'AppData/Local/Microsoft/Windows/INetCache',
-            user_profile / 'AppData/Local/Microsoft/Windows/INetCookies',
-            user_profile / 'AppData/Local/Microsoft/Windows/History'
-        ])
+    for dir_path in system_dirs:
+        try:
+            resolved = dir_path.resolve()
+            if resolved.exists() and os.access(resolved, os.R_OK):
+                temp_dirs.add(resolved)
+        except (OSError, RuntimeError):
+            continue
     
-    # 过滤并去重
-    return list(set(p.resolve() for p in temp_dirs if p.exists()))
+    return sorted(temp_dirs, key=lambda x: len(str(x)), reverse=True)
 
-def clean_temp(preview: bool = True):
-    """清理系统临时文件"""
+def clean_temp(preview: bool = True) -> int:
+    """清理系统临时文件，返回删除的项目数"""
+    deleted_count = 0
     temp_dirs = get_system_temp_dirs()
     
     logging.info(f'扫描 {len(temp_dirs)} 个临时目录')
@@ -126,22 +198,21 @@ def clean_temp(preview: bool = True):
         try:
             logging.info(f'扫描临时目录: {temp_dir}')
             for item in temp_dir.iterdir():
-                # 排除关键系统目录
-                if any(protected in item.name.lower() for protected in ['winsxs', 'system32']):
-                    continue
-                    
                 # 跳过新创建的文件（最近1小时）
                 if item.stat().st_ctime > (time.time() - 3600):
                     logging.debug(f'跳过新文件: {item} (创建时间: {time.ctime(item.stat().st_ctime)})')
                     continue
                     
-                safe_delete(item, preview=preview)
+                if safe_delete(item, preview):
+                    deleted_count += 1
         except PermissionError as e:
             logging.warning(f'[警告] 访问临时目录被拒绝: {temp_dir} - {e}')
         except Exception as e:
             logging.error(f'[错误] 清理临时目录失败: {temp_dir} - {e}')
+    
+    return deleted_count
 
-def get_browser_cache_paths():
+def get_browser_cache_paths() -> List[Path]:
     """获取所有浏览器缓存路径"""
     cache_paths = []
     user_profile = Path(os.environ.get('USERPROFILE', ''))
@@ -168,25 +239,33 @@ def get_browser_cache_paths():
         'Brave': [
             'AppData/Local/BraveSoftware/Brave-Browser/User Data/*/Cache',
             'AppData/Local/BraveSoftware/Brave-Browser/User Data/*/CacheStorage',
+        ],
+        'Opera': [
+            'AppData/Roaming/Opera Software/Opera Stable/Cache',
+            'AppData/Roaming/Opera Software/Opera Stable/Service Worker/CacheStorage',
         ]
     }
     
     # 构建路径模式
     for browser, patterns in browsers.items():
         for pattern in patterns:
-            for path in user_profile.glob(pattern):
-                if path.is_dir():
-                    cache_paths.append(path)
+            try:
+                for path in user_profile.glob(pattern):
+                    if path.is_dir():
+                        cache_paths.append(path)
+            except Exception as e:
+                logging.warning(f'获取{browser}缓存路径失败: {e}')
     
     return cache_paths
 
-def clean_browser_cache(preview: bool = True):
-    """清理浏览器缓存"""
+def clean_browser_cache(preview: bool = True) -> int:
+    """清理浏览器缓存，返回删除的项目数"""
+    deleted_count = 0
     cache_paths = get_browser_cache_paths()
     
     if not cache_paths:
         logging.info('未找到浏览器缓存目录')
-        return
+        return 0
         
     logging.info(f'找到 {len(cache_paths)} 个浏览器缓存目录')
     
@@ -194,52 +273,59 @@ def clean_browser_cache(preview: bool = True):
         try:
             logging.info(f'清理缓存: {cache_dir}')
             for item in cache_dir.iterdir():
-                safe_delete(item, preview=preview)
+                if safe_delete(item, preview):
+                    deleted_count += 1
         except Exception as e:
             logging.error(f'[错误] 清理浏览器缓存失败: {cache_dir} - {e}')
+    
+    return deleted_count
 
-def clean_recycle_bin(preview: bool = True):
-    """安全清空回收站"""
+def clean_recycle_bin(preview: bool = True) -> bool:
+    """安全清空回收站，返回是否执行了操作"""
     if preview:
         logging.info('[预览] 将清空回收站')
-        return
+        return False
         
     try:
         winshell.recycle_bin().empty(confirm=False, show_progress=False, sound=False)
         logging.info('[删除] 回收站已清空')
+        return True
     except Exception as e:
         logging.error(f'[错误] 清空回收站失败: {str(e)}')
+        return False
 
-def clean_downloads(preview: bool = True):
-    """清理下载目录中的临时文件"""
+def clean_downloads(preview: bool = True) -> int:
+    """清理下载目录，返回删除的项目数"""
+    deleted_count = 0
     downloads_path = Path.home() / 'Downloads'
-    if not downloads_path.exists():
-        return
-        
-    # 常见可删除的临时文件类型
-    temp_extensions = {
-        '.tmp', '.temp', '.download', '.crdownload', 
-        '.part', '.partial', '.dmp', '.log', '.bak'
-    }
     
+    if not downloads_path.exists():
+        return 0
+        
     logging.info(f'扫描下载目录: {downloads_path}')
     
     for item in downloads_path.iterdir():
         # 删除特定扩展名的文件
-        if item.suffix.lower() in temp_extensions:
-            safe_delete(item, preview)
-            
+        if item.suffix.lower() in Config.TEMP_EXTENSIONS:
+            if safe_delete(item, preview):
+                deleted_count += 1
+                
         # 删除空目录
         if item.is_dir() and not any(item.iterdir()):
-            safe_delete(item, preview)
+            if safe_delete(item, preview):
+                deleted_count += 1
+    
+    return deleted_count
 
+#  主程序 
 def main(preview: bool = True):
     """主清理函数"""
     logging.info('=== 开始清理 ===')
+    start_time = time.time()
     
-    # 检查管理员权限
-    if not is_admin():
-        logging.warning('⚠️ 警告: 未以管理员权限运行，部分操作可能受限')
+    # 管理员权限检查
+    if not preview and not is_admin():
+        require_admin()
     
     # 用户确认
     if not preview:
@@ -249,22 +335,29 @@ def main(preview: bool = True):
             return
     
     # 执行清理任务
-    clean_temp(preview)
-    clean_browser_cache(preview)
-    clean_recycle_bin(preview)
-    clean_downloads(preview)
+    total_deleted = 0
+    total_deleted += clean_temp(preview)
+    total_deleted += clean_browser_cache(preview)
+    if clean_recycle_bin(preview):
+        total_deleted += 1  # 回收站算作一个项目
+    total_deleted += clean_downloads(preview)
     
-    logging.info('=== 清理完成 ===')
+    elapsed = time.time() - start_time
+    logging.info(f'=== 清理完成 ===\n'
+                 f'总操作项目: {total_deleted}\n'
+                 f'耗时: {elapsed:.2f}秒')
 
 if __name__ == '__main__':
     import argparse
-    import time
-
-    parser = argparse.ArgumentParser(description='Windows 垃圾清理工具')
+    
+    parser = argparse.ArgumentParser(description='Windows 垃圾清理工具 (安全增强版)')
     parser.add_argument('--run', action='store_true', help='真正执行清理（默认仅预览）')
     parser.add_argument('--debug', action='store_true', help='启用调试日志')
     args = parser.parse_args()
 
+    # 初始化日志
+    init_logging()
+    
     # 设置调试日志级别
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -276,13 +369,11 @@ if __name__ == '__main__':
         print('⚠️ 使用 --run 参数执行实际删除操作\n')
     
     try:
-        start_time = time.time()
         main(preview=not args.run)
-        elapsed = time.time() - start_time
-        logging.info(f'清理耗时: {elapsed:.2f}秒')
     except KeyboardInterrupt:
         logging.info('\n操作已取消')
         sys.exit(0)
     except Exception as e:
         logging.exception(f'程序发生严重错误: {str(e)}')
         sys.exit(1)
+
