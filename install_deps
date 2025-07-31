@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+一键扫描并安装 cleaner.py 所需的全部第三方库
+python install_deps.py [--upgrade]
+"""
+import ast
+import subprocess
+import sys
+from pathlib import Path
+import importlib.util
+
+# 如果没有 rich，先用基本 print
+try:
+    from rich.console import Console
+    console = Console()
+except ImportError:
+    class FakeConsole:
+        def print(self, *args, **kw): print(*args)
+    console = FakeConsole()
+
+PY_EXE = Path(sys.executable)
+SCRIPT = Path(__file__).with_name("cleaner.py")   # 与当前脚本同目录的 cleaner.py
+
+# ---------- 工具 ----------
+def is_stdlib(name: str) -> bool:
+    """粗略判断是否为标准库"""
+    # Python 标准库列表（3.8-3.12 通用）
+    stdlibs = {
+        "os","sys","re","time","json","logging","pathlib","argparse",
+        "ctypes","subprocess","importlib","typing","collections","enum",
+        "functools","itertools","threading","asyncio","urllib","http",
+        "shutil","tempfile","zipfile","gzip","csv","sqlite3","hashlib",
+        "base64","binascii","datetime","zoneinfo","calendar","math",
+        "random","secrets","uuid","email","html","xml","socket","ssl",
+        "ftplib","smtplib","imaplib","poplib","telnetlib","http.server",
+        "xmlrpc","socketserver","wsgiref","tkinter","turtle","unittest",
+        "doctest","pdb","trace","traceback","gc","inspect","pickle",
+        "marshal","shelve","dbm","sqlite3","gzip","bz2","lzma",
+        "zipfile","tarfile","configparser","csv","gettext","locale",
+    }
+    return name in stdlibs
+
+def installed(pkg: str) -> bool:
+    return importlib.util.find_spec(pkg) is not None
+
+def pip_install(pkg: str, upgrade: bool) -> bool:
+    cmd = [str(PY_EXE), "-m", "pip", "install", "-i",
+           "https://pypi.tuna.tsinghua.edu.cn/simple"]
+    if upgrade:
+        cmd += ["--upgrade"]
+    cmd += [pkg]
+    console.print(f"[dim]{' '.join(cmd)}[/dim]")
+    try:
+        subprocess.check_call(cmd)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+# ---------- 主逻辑 ----------
+def extract_imports(file: Path) -> set[str]:
+    """解析 AST 抓取所有顶级 import / from ... import"""
+    tree = ast.parse(file.read_text(encoding="utf-8"), filename=str(file))
+    pkgs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                pkgs.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                pkgs.add(node.module.split(".")[0])
+    return pkgs
+
+def main() -> None:
+    upgrade = "--upgrade" in sys.argv[1:]
+    if not SCRIPT.exists():
+        console.print(f"[red]未找到 {SCRIPT.name}，请确保脚本位于同一目录[/red]")
+        sys.exit(1)
+
+    console.print(f"[bold green]正在扫描 {SCRIPT.name} 的第三方依赖...[/bold green]")
+    all_pkgs = extract_imports(SCRIPT)
+    third = [p for p in sorted(all_pkgs) if not is_stdlib(p)]
+
+    if not third:
+        console.print("[green]✔ 未发现需要额外安装的第三方库[/green]")
+        return
+
+    console.print(f"[yellow]检测到待安装库：{', '.join(third)}[/yellow]")
+
+    to_install = [p for p in third if not installed(p)] if not upgrade else third
+    if not to_install:
+        console.print("[green]✔ 所有库均已安装[/green]")
+        return
+
+    console.print("[yellow]开始安装...[/yellow]")
+    failed = []
+    for pkg in to_install:
+        if pip_install(pkg, upgrade=upgrade):
+            console.print(f"[green]✔ 安装成功：{pkg}[/green]")
+        else:
+            failed.append(pkg)
+            console.print(f"[red]✖ 安装失败：{pkg}[/red]")
+
+    # 验证
+    still_missing = [p for p in to_install if not installed(p)]
+    if still_missing:
+        console.print(f"[red]以下库仍缺失：{', '.join(still_missing)}[/red]")
+        sys.exit(1)
+    console.print("[bold green]所有依赖已就绪，可运行 cleaner.py[/bold green]")
+
+if __name__ == "__main__":
+    main()
