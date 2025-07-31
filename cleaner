@@ -4,42 +4,164 @@ import re
 import logging
 import ctypes
 import time
+import winshell
+import json
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from send2trash import send2trash
-from typing import Set, List, Tuple
+from typing import Set, List, Tuple, Iterable, Optional, Dict
 
-# =============  新增：rich 引入  =============
+# ============= Rich 增强引入 =============
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
 from rich.panel import Panel
 from rich.text import Text
 from rich import box
+from rich.theme import Theme
+from rich.columns import Columns
+from rich.align import Align
+from rich.style import Style
+from rich.padding import Padding
+from rich.rule import Rule
+from rich.syntax import Syntax
+from rich.markdown import Markdown
 
-console = Console()
-# ============================================
+# 自定义主题
+custom_theme = Theme({
+    "success": "bold green",
+    "warning": "bold yellow",
+    "error": "bold red",
+    "info": "bold blue",
+    "header": "bold white on dark_blue",
+    "highlight": "bold cyan",
+    "progress": "bold magenta",
+    "path": "bright_white",
+    "size": "bright_cyan"
+})
+console = Console(theme=custom_theme)
+
+def print_header(title: str):
+    """美化标题输出"""
+    console.print()
+    console.print(Rule(title, style="header"), justify="center")
+    console.print()
+
+def print_section(title: str, content: str = ""):
+    """美化分区输出"""
+    console.print(Panel.fit(
+        content,
+        title=title,
+        title_align="left",
+        border_style="progress",
+        padding=(1, 2)
+    ))
+
+def print_action(message: str, status: str = "info"):
+    """美化操作状态输出"""
+    icons = {
+        "info": "ℹ️",
+        "success": "✅",
+        "warning": "⚠️",
+        "error": "❌",
+        "skip": "⏩"
+    }
+    console.print(f"{icons.get(status, '')} [{status}]{message}[/]")
+
+def print_file_action(path: Path, action: str, size_mb: float = 0):
+    """美化文件操作输出"""
+    actions = {
+        "delete": ("[red]删除[/red]", "❌"),
+        "skip": ("[yellow]跳过[/yellow]", "⏩"),
+        "preview": ("[dim]预览[/dim]", "👁️"),
+        "error": ("[red]错误[/red]", "❗")
+    }
+    style, icon = actions.get(action, ("", ""))
+    size_info = f"[size]{size_mb:.1f} MB[/]" if size_mb > 0 else ""
+    console.print(
+        f"{icon} {style} {action.capitalize():<7} "
+        f"[path]{str(path)}[/] {size_info}"
+    )
+
+def print_summary_table(title: str, data: List[Tuple[str, str]]):
+    """美化汇总表格输出"""
+    table = Table(title=title, box=box.ROUNDED, show_header=False)
+    table.add_column("Item", style="highlight", no_wrap=True)
+    table.add_column("Value", style="info")
+    for item, value in data:
+        table.add_row(item, value)
+    console.print(Padding(table, (1, 4)))
+
+def print_progress_bar(description: str, total: int = None):
+    """增强进度条样式"""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(complete_style="progress", finished_style="success"),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+        console=console,
+        expand=True
+    )
+# ======================================
 
 # ================= 配置 =================
 class Config:
-    WHITELIST_REGEX = re.compile(
-        r'(desktop\.ini|thumbs\.db|'
-        r'node_modules|\.git|\.?venv|env|'
-        r'(windows|winsxs|system32|boot|intel|amd|nvidia)[\\/]|'
-        r'system volume information|'
-        r'\$recycle\.bin|'
-        r'appdata|program files|'
-        r'perflogs|msocache)',
-        re.IGNORECASE
-    )
-    TEMP_EXTENSIONS = {'.tmp', '.temp', '.download', '.crdownload',
-                       '.part', '.partial', '.dmp', '.log', '.bak'}
-    MAX_DIR_DEPTH = 20
-    LOG_FILE = 'cleaner.log'
-    LOG_MAX_SIZE = 5 * 1024 * 1024
-    LOG_BACKUP_COUNT = 3
+    CONFIG_FILE = Path.home() / '.cleaner_config.json'
+    
+    # 默认配置
+    DEFAULT_CONFIG = {
+        "WHITELIST_REGEX": r'(desktop\.ini|thumbs\.db|node_modules|\.git|\.?venv|env|'
+                          r'(windows|winsxs|system32|boot|intel|amd|nvidia)[\\/]|'
+                          r'system volume information|\$recycle\.bin|'
+                          r'appdata|program files|perflogs|msocache)',
+        "TEMP_EXTENSIONS": ['.tmp', '.temp', '.download', '.crdownload',
+                           '.part', '.partial', '.dmp', '.log', '.bak'],
+        "MAX_DIR_DEPTH": 20,
+        "LOG_FILE": str(Path.home() / 'cleaner.log'),
+        "LOG_MAX_SIZE": 5 * 1024 * 1024,
+        "LOG_BACKUP_COUNT": 3,
+        "SAFETY_FILE_SIZE_MB": 100,
+        "SYSTEM_FILE_SIGNATURES": {
+            "notepad.exe": "a8c8d6e7d48e284d85f2c79a3929bd53",
+            "explorer.exe": "1e3d6e6f0e3e4e5d6e7f8e9d0e1e2e3e4"
+        },
+        "THREAD_POOL_SIZE": 4,
+        "EXCLUDE_RECENT_FILES_HOURS": 1
+    }
+    
+    def __init__(self):
+        self.load_config()
+        
+    def load_config(self):
+        """从配置文件加载配置，不存在则使用默认配置"""
+        try:
+            if self.CONFIG_FILE.exists():
+                with open(self.CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    user_config = json.load(f)
+                    for key, value in user_config.items():
+                        if key in self.DEFAULT_CONFIG:
+                            self.DEFAULT_CONFIG[key] = value
+        except Exception as e:
+            logging.warning(f"加载配置文件失败: {e}")
+            
+        # 初始化配置属性
+        self.WHITELIST_REGEX = re.compile(self.DEFAULT_CONFIG["WHITELIST_REGEX"], re.IGNORECASE)
+        self.TEMP_EXTENSIONS = set(self.DEFAULT_CONFIG["TEMP_EXTENSIONS"])
+        self.MAX_DIR_DEPTH = self.DEFAULT_CONFIG["MAX_DIR_DEPTH"]
+        self.LOG_FILE = Path(self.DEFAULT_CONFIG["LOG_FILE"])
+        self.LOG_MAX_SIZE = self.DEFAULT_CONFIG["LOG_MAX_SIZE"]
+        self.LOG_BACKUP_COUNT = self.DEFAULT_CONFIG["LOG_BACKUP_COUNT"]
+        self.SAFETY_FILE_SIZE_MB = self.DEFAULT_CONFIG["SAFETY_FILE_SIZE_MB"]
+        self.SYSTEM_FILE_SIGNATURES = self.DEFAULT_CONFIG["SYSTEM_FILE_SIGNATURES"]
+        self.THREAD_POOL_SIZE = self.DEFAULT_CONFIG["THREAD_POOL_SIZE"]
+        self.EXCLUDE_RECENT_FILES_HOURS = self.DEFAULT_CONFIG["EXCLUDE_RECENT_FILES_HOURS"]
 
-# ============= 日志初始化（含 rich 彩色） =============
+config = Config()
+
+# ============= 日志初始化 =============
 def init_logging(quiet: bool = False):
     class SensitiveFilter(logging.Filter):
         def filter(self, record):
@@ -48,9 +170,9 @@ def init_logging(quiet: bool = False):
             return True
 
     file_handler = RotatingFileHandler(
-        Config.LOG_FILE,
-        maxBytes=Config.LOG_MAX_SIZE,
-        backupCount=Config.LOG_BACKUP_COUNT,
+        config.LOG_FILE,
+        maxBytes=config.LOG_MAX_SIZE,
+        backupCount=config.LOG_BACKUP_COUNT,
         encoding='utf-8'
     )
     file_handler.addFilter(SensitiveFilter())
@@ -65,7 +187,7 @@ def init_logging(quiet: bool = False):
 
     logging.basicConfig(level=logging.INFO, handlers=handlers)
 
-# ============= 工具函数 =============
+# ============= 安全工具函数 =============
 def is_admin() -> bool:
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
@@ -74,16 +196,57 @@ def is_admin() -> bool:
 
 def require_admin():
     if not is_admin():
-        console.print('[red]此操作需要管理员权限[/red]')
-        if ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1) <= 32:
-            console.print('[red]权限提升失败[/red]')
+        print_header("权限警告")
+        print_section("需要管理员权限", "此操作需要管理员权限才能继续")
+        params = " ".join(f'"{arg}"' for arg in sys.argv)
+        if ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1) <= 32:
+            print_action("权限提升失败", "error")
         sys.exit(1)
 
+def is_safe_path(path: Path) -> bool:
+    """检查路径是否安全（防止路径遍历）"""
+    try:
+        path.resolve().relative_to(Path.cwd())
+        return True
+    except ValueError:
+        return False
+
 def is_whitelisted(path: Path) -> bool:
-    return bool(Config.WHITELIST_REGEX.search(str(path)))
+    """检查路径是否在白名单中"""
+    if not is_safe_path(path):
+        return True
+    return bool(config.WHITELIST_REGEX.search(str(path)))
+
+def is_system_file(path: Path) -> bool:
+    """检查是否是受保护的系统文件"""
+    if not path.is_file():
+        return False
+        
+    try:
+        file_name = path.name.lower()
+        if file_name in config.SYSTEM_FILE_SIGNATURES:
+            with open(path, 'rb') as f:
+                file_hash = hashlib.md5(f.read()).hexdigest()
+            return file_hash == config.SYSTEM_FILE_SIGNATURES[file_name]
+        return False
+    except Exception:
+        logging.exception(f"系统文件检查异常: {path}")
+        return True
+
+def is_hardlink(path: Path) -> bool:
+    """检查是否是硬链接"""
+    try:
+        return path.is_file() and path.stat().st_nlink > 1
+    except Exception:
+        logging.exception(f"硬链接检查异常: {path}")
+        return False
 
 def is_resource_in_use(path: Path) -> bool:
+    """检查资源是否被占用"""
     try:
+        if not is_safe_path(path):
+            return True
+            
         if path.is_file():
             try:
                 fd = os.open(path, os.O_RDWR | os.O_EXCL | os.O_NOINHERIT)
@@ -104,159 +267,255 @@ def is_resource_in_use(path: Path) -> bool:
         logging.exception(f"资源检查异常: {path}")
         return True
 
-# ============= 安全删除（含大小统计） =============
+def calculate_size(path: Path) -> int:
+    """高效计算文件或目录大小（多线程优化）"""
+    if not is_safe_path(path):
+        return 0
+        
+    if path.is_file():
+        return path.stat().st_size if not is_hardlink(path) else 0
+        
+    total = 0
+    with ThreadPoolExecutor(max_workers=config.THREAD_POOL_SIZE) as executor:
+        futures = []
+        for root, _, files in os.walk(path):
+            for file in files:
+                file_path = Path(root) / file
+                futures.append(executor.submit(
+                    lambda p: p.stat().st_size if p.is_file() and not is_hardlink(p) else 0,
+                    file_path
+                ))
+        
+        for future in as_completed(futures):
+            total += future.result()
+            
+    return total
+
+def confirm_large_file(path: Path, size_mb: float) -> bool:
+    """大文件二次确认"""
+    if size_mb < config.SAFETY_FILE_SIZE_MB:
+        return True
+    
+    print_header("大文件警告")
+    print_section(
+        "检测到大文件",
+        f"路径: [path]{path}[/]\n大小: [size]{size_mb:.1f} MB[/]"
+    )
+    confirm = console.input('[bold red]⚠️  确认删除此大文件? (y/n): [/]')
+    return confirm.lower() == 'y'
+
+# ============= 安全删除 =============
 def safe_delete(path: Path, preview: bool = True) -> Tuple[bool, int]:
     try:
+        # 安全检查
+        if not is_safe_path(path):
+            print_file_action(path, "skip")
+            return False, 0
+            
         if is_whitelisted(path):
-            console.print(f'[yellow]跳过[/yellow] 白名单: {path}')
+            print_file_action(path, "skip")
             return False, 0
-        if path.is_symlink():
-            console.print(f'[cyan]跳过[/cyan] 符号链接: {path}')
+            
+        if is_system_file(path):
+            print_file_action(path, "skip")
             return False, 0
+            
+        if path.is_symlink() or is_hardlink(path):
+            print_file_action(path, "skip")
+            return False, 0
+            
         if path.is_dir():
             dir_depth = len(str(path.resolve()).split(os.sep))
-            if dir_depth > Config.MAX_DIR_DEPTH:
-                console.print(f'[cyan]跳过[/cyan] 层级过深: {path}')
+            if dir_depth > config.MAX_DIR_DEPTH:
+                print_file_action(path, "skip")
                 return False, 0
+                
         if is_resource_in_use(path):
-            console.print(f'[magenta]跳过[/magenta] 占用中: {path}')
+            print_file_action(path, "skip")
             return False, 0
 
-        size = sum(f.stat().st_size for f in path.rglob('*') if f.is_file()) if path.is_dir() else (path.stat().st_size if path.is_file() else 0)
+        # 计算大小
+        size = calculate_size(path)
+        size_mb = size / 1024 / 1024
+        
         if preview:
-            console.print(f'[dim]预览[/dim] 将删除: {path}  ({size/1024:.1f} KB)')
+            print_file_action(path, "preview", size_mb)
             return False, 0
+            
+        # 大文件二次确认
+        if size_mb >= config.SAFETY_FILE_SIZE_MB:
+            if not confirm_large_file(path, size_mb):
+                print_file_action(path, "skip")
+                return False, 0
+                
+        # 执行删除
         send2trash(path)
-        console.print(f'[red]删除[/red] {"目录" if path.is_dir() else "文件"}: {path}  ({size/1024:.1f} KB)')
+        print_file_action(path, "delete", size_mb)
         return True, size
     except Exception as e:
-        console.print(f'[red]错误[/red] 删除失败: {path} - {e}')
+        print_file_action(path, "error")
+        logging.exception(f"删除失败: {path}")
         return False, 0
 
-# ============= 获取系统临时目录 =============
+# ============= 清理功能 =============
 def get_system_temp_dirs() -> List[Path]:
+    """获取系统临时目录（增强安全性）"""
     temp_dirs = set()
     env_vars = ['TEMP', 'TMP', 'LOCALAPPDATA']
+    
     for var in env_vars:
         if path_str := os.environ.get(var):
             try:
                 path = Path(path_str).resolve()
-                if path.exists() and os.access(path, os.R_OK | os.W_OK):
+                if path.exists() and os.access(path, os.R_OK | os.W_OK) and is_safe_path(path):
                     temp_dirs.add(path)
             except Exception:
                 continue
+                
     system_dirs = [
         Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'Temp',
         Path('C:/Windows/Temp'),
         Path('C:/Windows/Logs'),
         Path('C:/Windows/Prefetch'),
     ]
+    
     for dir_path in system_dirs:
         try:
             resolved = dir_path.resolve()
-            if resolved.exists() and os.access(resolved, os.R_OK):
+            if resolved.exists() and os.access(resolved, os.R_OK) and is_safe_path(resolved):
                 temp_dirs.add(resolved)
         except Exception:
             continue
+            
     return sorted(temp_dirs, key=lambda x: len(str(x)), reverse=True)
 
-# ============= 清理函数（带进度条） =============
-def clean_with_progress(name: str, paths: List[Path], preview: bool) -> int:
+def clean_temp(preview: bool = True) -> int:
+    """清理临时文件（美化输出）"""
+    print_header("清理临时文件")
+    temp_dirs = get_system_temp_dirs()
+    
+    if not temp_dirs:
+        print_action("未找到可清理的临时目录", "warning")
+        return 0
+    
+    print_section("扫描目录", "\n".join(f"• [path]{d}[/]" for d in temp_dirs))
+    
     total_size = 0
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console
-    ) as progress:
-        task = progress.add_task(f"扫描 {name}...", total=None)
-        for path in paths:
-            if path.exists():
-                for item in path.iterdir():
-                    if item.is_file() and item.stat().st_ctime > (time.time() - 3600):
+    with print_progress_bar("扫描临时文件...") as progress:
+        task = progress.add_task("清理中...", total=len(temp_dirs))
+        for temp_dir in temp_dirs:
+            if temp_dir.exists():
+                for item in temp_dir.iterdir():
+                    # 跳过最近创建的文件
+                    recent_threshold = time.time() - config.EXCLUDE_RECENT_FILES_HOURS * 3600
+                    if (item.is_file() or item.is_dir()) and item.stat().st_ctime > recent_threshold:
                         continue
+                        
                     ok, size = safe_delete(item, preview)
                     if ok:
                         total_size += size
             progress.advance(task)
+    
+    size_mb = total_size / 1024 / 1024
+    print_summary_table("临时文件清理结果", [
+        ("扫描目录数", str(len(temp_dirs))),
+        ("释放空间", f"{size_mb:.2f} MB"),
+        ("模式", "预览" if preview else "实际执行")
+    ])
     return total_size
 
-def clean_temp(preview: bool = True) -> int:
-    temp_dirs = get_system_temp_dirs()
-    console.print(Panel(f"扫描 [cyan]{len(temp_dirs)}[/cyan] 个临时目录", title="临时文件"))
-    return clean_with_progress("临时文件", temp_dirs, preview)
-
-def get_browser_cache_paths() -> List[Path]:
-    cache_paths = []
-    user_profile = Path(os.environ.get('USERPROFILE', ''))
-    if not user_profile.exists():
-        return cache_paths
-    browsers = {
-        'Chrome': [
-            'AppData/Local/Google/Chrome/User Data/*/Cache',
-            'AppData/Local/Google/Chrome/User Data/*/CacheStorage',
-            'AppData/Local/Google/Chrome/User Data/*/Service Worker/CacheStorage',
-        ],
-        'Edge': [
-            'AppData/Local/Microsoft/Edge/User Data/*/Cache',
-            'AppData/Local/Microsoft/Edge/User Data/*/CacheStorage',
-            'AppData/Local/Microsoft/Edge/User Data/*/Service Worker/CacheStorage',
-        ],
-        'Firefox': [
-            'AppData/Local/Mozilla/Firefox/Profiles/*/cache2',
-            'AppData/Local/Mozilla/Firefox/Profiles/*/thumbnails',
-        ],
-        'Brave': [
-            'AppData/Local/BraveSoftware/Brave-Browser/User Data/*/Cache',
-            'AppData/Local/BraveSoftware/Brave-Browser/User Data/*/CacheStorage',
-        ],
-        'Opera': [
-            'AppData/Roaming/Opera Software/Opera Stable/Cache',
-            'AppData/Roaming/Opera Software/Opera Stable/Service Worker/CacheStorage',
-        ]
-    }
-    for browser, patterns in browsers.items():
-        for pattern in patterns:
-            try:
-                for path in user_profile.glob(pattern):
-                    if path.is_dir():
-                        cache_paths.append(path)
-            except Exception as e:
-                logging.warning(f'获取{browser}缓存路径失败: {e}')
-    return cache_paths
-
 def clean_browser_cache(preview: bool = True) -> int:
-    cache_paths = get_browser_cache_paths()
-    console.print(Panel(f"找到 [cyan]{len(cache_paths)}[/cyan] 个浏览器缓存目录", title="浏览器缓存"))
-    return clean_with_progress("浏览器缓存", cache_paths, preview)
+    """清理浏览器缓存（美化输出）"""
+    print_header("清理浏览器缓存")
+    browsers = {
+        "Chrome": Path(os.environ.get('LOCALAPPDATA', '')) / 'Google' / 'Chrome' / 'User Data' / 'Default' / 'Cache',
+        "Edge": Path(os.environ.get('LOCALAPPDATA', '')) / 'Microsoft' / 'Edge' / 'User Data' / 'Default' / 'Cache',
+        "Firefox": Path(os.environ.get('LOCALAPPDATA', '')) / 'Mozilla' / 'Firefox' / 'Profiles'
+    }
+    
+    valid_browsers = {}
+    for name, path in browsers.items():
+        if path.exists():
+            valid_browsers[name] = path
+    
+    if not valid_browsers:
+        print_action("未找到浏览器缓存目录", "warning")
+        return 0
+    
+    print_section("检测到的浏览器", "\n".join(
+        f"• {name}: [path]{path}[/]" for name, path in valid_browsers.items()
+    ))
+    
+    total_size = 0
+    with print_progress_bar("扫描浏览器缓存...") as progress:
+        task = progress.add_task("清理中...", total=len(valid_browsers))
+        for name, cache_dir in valid_browsers.items():
+            if cache_dir.exists():
+                for item in cache_dir.iterdir():
+                    ok, size = safe_delete(item, preview)
+                    if ok:
+                        total_size += size
+            progress.advance(task)
+    
+    size_mb = total_size / 1024 / 1024
+    print_summary_table("浏览器缓存清理结果", [
+        ("浏览器数量", str(len(valid_browsers))),
+        ("释放空间", f"{size_mb:.2f} MB"),
+        ("模式", "预览" if preview else "实际执行")
+    ])
+    return total_size
 
 def clean_recycle_bin(preview: bool = True) -> int:
+    """清空回收站（美化输出）"""
+    print_header("清理回收站")
+    
     if preview:
-        console.print("[dim]预览[/dim] 将清空回收站")
+        print_action("预览模式跳过回收站清理", "info")
         return 0
+    
     try:
+        print_action("正在清空回收站...", "info")
         winshell.recycle_bin().empty(confirm=False, show_progress=False, sound=False)
-        console.print("[red]已清空[/red] 回收站")
-        return 1
+        print_action("回收站已清空", "success")
+        return 0  # 无法计算回收站大小
     except Exception as e:
-        console.print(f"[red]错误[/red] 清空回收站失败: {e}")
+        print_action(f"清空回收站失败: {e}", "error")
         return 0
 
 def clean_downloads(preview: bool = True) -> int:
-    downloads_path = Path.home() / 'Downloads'
-    if not downloads_path.exists():
+    """清理下载目录（美化输出）"""
+    print_header("清理下载目录")
+    downloads_dir = Path.home() / 'Downloads'
+    
+    if not downloads_dir.exists():
+        print_action("下载目录不存在", "warning")
         return 0
-    console.print(Panel(f"扫描下载目录: [cyan]{downloads_path}[/cyan]", title="下载目录"))
+    
+    print_section("扫描目录", f"[path]{downloads_dir}[/]")
+    
     total_size = 0
-    for item in downloads_path.iterdir():
-        if item.suffix.lower() in Config.TEMP_EXTENSIONS or (item.is_dir() and not any(item.iterdir())):
-            ok, size = safe_delete(item, preview)
-            if ok:
-                total_size += size
+    count = 0
+    with print_progress_bar("扫描下载文件...") as progress:
+        task = progress.add_task("清理中...", total=None)
+        for item in downloads_dir.iterdir():
+            if item.suffix.lower() in config.TEMP_EXTENSIONS:
+                ok, size = safe_delete(item, preview)
+                if ok:
+                    total_size += size
+                    count += 1
+            progress.advance(task)
+    
+    size_mb = total_size / 1024 / 1024
+    print_summary_table("下载目录清理结果", [
+        ("删除文件数", str(count)),
+        ("释放空间", f"{size_mb:.2f} MB"),
+        ("模式", "预览" if preview else "实际执行")
+    ])
     return total_size
 
-# ============= 主程序 =============
 def main(preview: bool = True, quiet: bool = False):
-    console.print(Panel("Windows 垃圾清理工具 (安全增强版)", style="bold green"))
+    """主函数（美化输出）"""
+    print_header("Windows 垃圾清理工具")
     start_time = time.time()
 
     if not preview and not is_admin():
@@ -264,9 +523,10 @@ def main(preview: bool = True, quiet: bool = False):
 
     if not preview:
         if not quiet:
+            print_section("警告", "即将实际删除文件，请确认!")
             confirm = console.input('[bold red]⚠️  确认实际删除文件? (y/n): [/]')
             if confirm.lower() != 'y':
-                console.print("[yellow]操作已取消[/yellow]")
+                print_action("操作已取消", "warning")
                 return
 
     total_size = 0
@@ -276,16 +536,29 @@ def main(preview: bool = True, quiet: bool = False):
     total_size += clean_downloads(preview)
 
     elapsed = time.time() - start_time
-    table = Table(title="清理结果", box=box.SIMPLE_HEAVY)
-    table.add_column("项目", style="cyan")
-    table.add_column("值", style="magenta")
-    table.add_row("释放空间", f"{total_size/1024/1024:.2f} MB")
-    table.add_row("耗时", f"{elapsed:.2f} 秒")
-    console.print(table)
+    size_mb = total_size / 1024 / 1024
+    size_gb = size_mb / 1024
+    
+    # 美化结果展示
+    print_header("清理完成")
+    print_summary_table("最终清理结果", [
+        ("释放总空间", f"{size_mb:.2f} MB ({size_gb:.2f} GB)"),
+        ("总耗时", f"{elapsed:.2f} 秒"),
+        ("执行模式", "实际执行" if not preview else "预览")
+    ])
+    
+    # 保存配置选项
+    if not quiet and console.input('[bold]是否保存当前配置? (y/n): [/]').lower() == 'y':
+        try:
+            with open(config.CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(config.DEFAULT_CONFIG, f, indent=4)
+            print_action(f"配置已保存到: {config.CONFIG_FILE}", "success")
+        except Exception as e:
+            print_action(f"保存配置失败: {e}", "error")
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Windows 垃圾清理工具 (安全增强版)')
+    parser = argparse.ArgumentParser(description='Windows 垃圾清理工具 ')
     parser.add_argument('--run', action='store_true', help='真正执行清理（默认仅预览）')
     parser.add_argument('--debug', action='store_true', help='启用调试日志')
     parser.add_argument('--quiet', action='store_true', help='静默模式（无终端输出，只写日志）')
@@ -296,13 +569,13 @@ if __name__ == '__main__':
         logging.getLogger().setLevel(logging.DEBUG)
 
     if not args.run and not args.quiet:
-        console.print('\n[dim]运行在预览模式（不会实际删除文件）[/dim]')
-        console.print('[dim]使用 --run 参数执行实际删除操作[/dim]\n')
+        print_section("信息", "运行在预览模式（不会实际删除文件）")
+        print_action("使用 --run 参数执行实际删除操作", "info")
 
     try:
         main(preview=not args.run, quiet=args.quiet)
     except KeyboardInterrupt:
-        console.print('\n[yellow]操作已取消[/yellow]')
+        print_action("操作已取消", "warning")
         sys.exit(0)
     except Exception as e:
         console.print_exception()
