@@ -2,7 +2,7 @@
 
 > **"SYSTEM OVERRIDE... PERFORMANCE UNLEASHED."**  
 
-![Win_Knightmare Logo](https://via.placeholder.com/150/000000/FFFFFF?text=Win_Knightmare)  
+![Win_Knightmare Logo](https://free.picui.cn/free/2025/08/05/689205fc74841.png)  
 
 ## 🔥 项目介绍  
 **Win_Knightmare** 是 **觉醒的Windows优化兵器库**，专为追求极致性能的战士打造。  
